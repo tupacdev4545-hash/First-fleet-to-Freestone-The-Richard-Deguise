@@ -97,13 +97,19 @@ So: about a dollar a month, dominated by the hosted zone if you add one.
 
 Open anyone's record and there are three ways in:
 
-- **A photograph — published instantly.** Every empty gallery slot is a **+**
-  button. Anyone who types the shared family passcode has their photograph on
-  the tree for everyone within seconds.
+- **A photograph — published instantly, and permanent.** Anyone who types the
+  shared family passcode has their photograph on the tree for everyone within
+  seconds. Each person has five spots, counting photographs already in
+  `tree.json`, and every photograph added uses one up for good: nobody with
+  the passcode can remove or replace one. Only your **Take it down** link can,
+  and that gives the spot back. Anyone with the passcode can choose which
+  photograph is the **main photo**, which is shown first in their carousel and
+  on their card in the tree.
 - **Their life story — published instantly.** Same passcode, same immediacy.
   The editor is prefilled with what the tree says now, so each writer extends
   the last rather than talking past them.
-- **A relative** — child, parent, spouse or sibling. This one still waits.
+- **A relative** — child, parent, spouse or sibling. This one waits for you,
+  and you approve it with one button in the email.
 
 Photographs and stories go up on their own. Anything that changes the *shape*
 of the tree — a new person, a new marriage — still comes to you first, because
@@ -209,8 +215,21 @@ passcode. Photographs never queue.
 2. The Lambda validates it, writes it to DynamoDB with `status: pending`, and
    emails you.
 3. You pass it to the relevant branch of the family to confirm.
-4. Once confirmed, put it into `src/data/tree.json` and run
-   `./scripts/deploy.sh`.
+4. For a new relative, press **Add to the tree** in the email. It opens a
+   confirm page in a new tab showing the details; nothing changes until you
+   press the button on that page (Gmail and virus scanners open email links on
+   their own, so the link itself is harmless). They are then on the tree for
+   everyone, drawn like anyone in `tree.json`, with no deploy. The confirm page
+   refuses anything that cannot be placed — a sibling of someone with no
+   parents recorded, or a third parent — and says why.
+5. A story written without the passcode still goes into
+   `src/data/tree.json` by hand, then `./scripts/deploy.sh`.
+
+For anything sent before the button existed, or an email you have lost:
+
+```bash
+./scripts/resend-pending.sh       # emails a fresh button for everyone waiting
+```
 
 ```bash
 ./scripts/submissions.sh          # waiting on you
@@ -221,7 +240,8 @@ passcode. Photographs never queue.
 
 Nothing that reshapes the tree changes on its own. The contributor's own
 browser shows it until they reload; everyone else sees it only after you
-publish.
+approve. An approved person can be taken down with the link on the page that
+confirmed them, or `./scripts/submissions.sh live` shows their id.
 
 ### Folding live contributions into the data file
 
@@ -230,7 +250,9 @@ browser merges the two: `tree.json` photos first, then live ones; live story if
 there is one, otherwise the record's blurb. That split can stand indefinitely.
 
 To make something permanent — say a story has settled and you want it in the
-repo — paste the text into that person's `blurb` in `tree.json`, copy any
+repo — paste the text into that person's `blurb` in `tree.json`. An approved
+person can be copied into `people` with the same `live-…` id they have in
+`gallery.json`, and the merge skips them from then on. Copy any
 photograph out of the site bucket into `public/photos/` and add it to their
 `photos` array, then take the live rows down with the links in their emails and
 deploy. The merge means the page looks identical before and after.

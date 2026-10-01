@@ -19,12 +19,13 @@ import PersonPanel, { type PendingRelative } from "./components/PersonPanel";
 import ContributeModal, {
   type ContributeMode,
 } from "./components/ContributeModal";
-import { deletePhoto, fetchOverlay } from "./lib/api";
-import type { LivePhoto, LiveStory } from "./lib/api";
-import ConfirmDelete from "./components/ConfirmDelete";
+import { fetchOverlay, setPrimaryPhoto } from "./lib/api";
+import type { LivePhoto, LiveRelative, LiveStory } from "./lib/api";
+import { applyAdditions } from "./lib/additions";
 import Splash from "./components/Splash";
 
-const data = treeData as TreeData;
+/** The transcribed record, as deployed. */
+const record = treeData as TreeData;
 
 const RELATIONSHIP_WORDS: Record<string, string> = {
   child: "child",
@@ -74,12 +75,19 @@ interface Pending {
 }
 
 export default function App() {
-  const layout = useMemo(() => buildLayout(data), []);
+  /** People the archivist has approved since the last deploy. */
+  const [added, setAdded] = useState<LiveRelative[]>([]);
+  /** Each person's chosen main photograph. */
+  const [primary, setPrimary] = useState<Record<string, string>>({});
+  /** The record with approved people hung on it — what the tree draws. */
+  const data = useMemo(() => applyAdditions(record, added), [added]);
+
+  const layout = useMemo(() => buildLayout(data), [data]);
   const peopleById = useMemo(() => {
     const m = new Map<string, Person>();
     for (const p of data.people) m.set(p.id, p);
     return m;
-  }, []);
+  }, [data]);
 
   /** How a partnership ended, where the family has said so. */
   const partnerNotes = useMemo(() => {
@@ -92,7 +100,7 @@ export default function App() {
       }
     }
     return m;
-  }, []);
+  }, [data]);
 
   /** Partners already recorded for a person, straight from the unions. */
   const partnersOf = useCallback(
@@ -109,7 +117,7 @@ export default function App() {
       }
       return out;
     },
-    [peopleById],
+    [peopleById, data],
   );
 
   const stageRef = useRef<HTMLDivElement>(null);
@@ -134,8 +142,6 @@ export default function App() {
   const [splash, setSplash] = useState(true);
   /** Photographs published since the last deploy, keyed by person. */
   const [live, setLive] = useState<Record<string, LivePhoto[]>>({});
-  /** The photograph the viewer has asked to remove, pending confirmation. */
-  const [removing, setRemoving] = useState<LivePhoto | null>(null);
   /** Life stories published since the last deploy, keyed by person. */
   const [stories, setStories] = useState<Record<string, LiveStory>>({});
   const animation = useRef<number | null>(null);
@@ -148,7 +154,44 @@ export default function App() {
     setStories(
       Object.fromEntries(overlay.stories.map((s) => [s.personId, s])),
     );
+    setPrimary(overlay.primary);
+    // Only re-lay the tree when the people actually changed, so a new
+    // photograph or story never shuffles the cards.
+    setAdded((prev) =>
+      JSON.stringify(prev) === JSON.stringify(overlay.relatives)
+        ? prev
+        : overlay.relatives,
+    );
   }, []);
+
+  /** Every photograph a person has, record first, as ids the API knows. */
+  const photosOf = useCallback(
+    (p: Person) => [
+      ...(p.photos ?? []).map((ph) => ({ id: ph.src, src: ph.src, caption: ph.caption })),
+      ...(live[p.id] ?? []).map((ph) => ({ id: ph.id, src: ph.src, caption: ph.caption })),
+    ],
+    [live],
+  );
+
+  /** The main photograph: the family's choice, else the first. */
+  const mainPhoto = useCallback(
+    (id: string) => {
+      const p = peopleById.get(id);
+      if (!p) return undefined;
+      const all = photosOf(p);
+      return (all.find((ph) => ph.id === primary[id]) ?? all[0])?.src;
+    },
+    [peopleById, photosOf, primary],
+  );
+
+  const choosePrimary = useCallback(
+    async (personId: string, photoId: string, passcode: string) => {
+      await setPrimaryPhoto(personId, photoId, passcode);
+      setPrimary((prev) => ({ ...prev, [personId]: photoId }));
+      window.setTimeout(() => void refreshGallery(), 1500);
+    },
+    [refreshGallery],
+  );
 
   /** What a person's life reads as now — the family's version wins. */
   const storyFor = useCallback(
@@ -323,7 +366,7 @@ export default function App() {
   const results = useMemo(() => {
     if (!query.trim()) return [];
     return data.people.filter((p) => matches(p, query)).slice(0, 40);
-  }, [query]);
+  }, [query, data]);
 
   const highlightIds = useMemo(() => {
     const q = query.trim();
@@ -338,7 +381,7 @@ export default function App() {
       ids = ids.filter((id) => inBranch.has(id));
     }
     return new Set(ids);
-  }, [query, results, branchFilter]);
+  }, [query, results, branchFilter, data]);
 
   const selected = selectedId ? peopleById.get(selectedId) ?? null : null;
   const hovered = hoveredId ? peopleById.get(hoveredId) ?? null : null;
@@ -470,7 +513,7 @@ export default function App() {
       m.set(b, (m.get(b) ?? 0) + 1);
     }
     return m;
-  }, []);
+  }, [data]);
 
   const present = (list: readonly string[]) =>
     list.filter((b) => (branchCounts.get(b) ?? 0) > 0);
@@ -598,6 +641,7 @@ export default function App() {
           onSelect={setSelectedId}
           ghosts={ghosts}
           stageRef={stageRef}
+          mainPhoto={mainPhoto}
         />
 
         {hovered && hoverPos && hovered.id !== selectedId && (
@@ -613,11 +657,11 @@ export default function App() {
             </div>
             <div className="thumbs">
               {[
-                ...(hovered.photos ?? []),
-                ...(live[hovered.id] ?? []).map((p) => ({
-                  src: p.src,
-                  caption: p.caption,
-                })),
+                ...photosOf(hovered).sort(
+                  (a, b) =>
+                    Number(b.id === primary[hovered.id]) -
+                    Number(a.id === primary[hovered.id]),
+                ),
                 ...pendingFor(hovered.id).photos,
               ]
                 .slice(0, 5)
@@ -652,7 +696,10 @@ export default function App() {
               partnerNotes.get(`${selected.id}|${otherId}`)
             }
             livePhotos={live[selected.id] ?? []}
-            onDeletePhoto={setRemoving}
+            primaryId={primary[selected.id]}
+            onSetPrimary={(photoId, passcode) =>
+              choosePrimary(selected.id, photoId, passcode)
+            }
             liveStory={stories[selected.id]}
             pendingPhotos={pendingFor(selected.id).photos}
             pendingBio={pendingFor(selected.id).bio}
@@ -724,27 +771,6 @@ export default function App() {
           </button>
         </div>
       </div>
-
-      {removing && (
-        <ConfirmDelete
-          photo={removing}
-          personName={peopleById.get(removing.personId)?.name ?? "this person"}
-          onCancel={() => setRemoving(null)}
-          onConfirm={async (passcode) => {
-            await deletePhoto(removing.id, passcode);
-            // Drop it locally at once so the gallery does not show a picture
-            // that no longer exists, then re-read to stay in step with S3.
-            setLive((prev) => ({
-              ...prev,
-              [removing.personId]: (prev[removing.personId] ?? []).filter(
-                (p) => p.id !== removing.id,
-              ),
-            }));
-            setRemoving(null);
-            window.setTimeout(() => void refreshGallery(), 1500);
-          }}
-        />
-      )}
 
       {modal && (
         <ContributeModal

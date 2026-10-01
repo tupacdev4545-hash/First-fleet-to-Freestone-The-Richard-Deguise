@@ -8,6 +8,7 @@ import {
   type LivePhoto,
 } from "../lib/api";
 import type { ContributeMode } from "./ContributeModal";
+import PhotoCarousel, { type CarouselPhoto } from "./PhotoCarousel";
 
 export interface PendingRelative {
   name: string;
@@ -20,13 +21,13 @@ interface Props {
   /** "divorced", "last partner" and so on, for the connected pills. */
   noteFor: (otherId: string) => string | undefined;
   /**
-   * Photographs the family has published since the last deploy. These carry an
-   * id, which is what makes them removable — anything from tree.json is part
-   * of the deployed record and can only be changed by editing that file.
+   * Photographs the family has published since the last deploy. Once added
+   * they stay: only the archivist's take-down link can remove one.
    */
   livePhotos: LivePhoto[];
-  /** Take a published photograph down for good. */
-  onDeletePhoto: (photo: LivePhoto) => void;
+  /** The family's chosen main photo for this person, if they chose one. */
+  primaryId?: string;
+  onSetPrimary: (photoId: string, passcode: string) => Promise<void>;
   /** The life story the family has published, which supersedes the record. */
   liveStory?: { text: string; by?: string };
   /** Just uploaded from this browser, before the gallery is re-read. */
@@ -46,7 +47,8 @@ export default function PersonPanel({
   relatives,
   noteFor,
   livePhotos,
-  onDeletePhoto,
+  primaryId,
+  onSetPrimary,
   liveStory,
   pendingPhotos,
   pendingBio,
@@ -60,22 +62,16 @@ export default function PersonPanel({
   const story = liveStory?.text ?? person.blurb;
   // Trove stops at the 1950s, so what to lead with depends on when they lived.
   const historical = isHistorical(person);
-  const approved: { photo: Photo; live?: LivePhoto }[] = [
-    ...(person.photos ?? []).map((photo) => ({ photo })),
-    ...livePhotos.map((live) => ({
-      photo: { src: live.src, caption: live.caption } as Photo,
-      live,
+  const photos: CarouselPhoto[] = [
+    ...(person.photos ?? []).map((p) => ({ id: p.src, src: p.src, caption: p.caption })),
+    ...livePhotos.map((p) => ({ id: p.id, src: p.src, caption: p.caption })),
+    ...pendingPhotos.map((p, i) => ({
+      id: `just-added-${i}`,
+      src: p.src,
+      caption: p.caption,
+      justAdded: true,
     })),
-  ];
-  const photos = [
-    ...approved,
-    ...pendingPhotos.map((photo) => ({ photo, live: undefined })),
   ].slice(0, MAX_PHOTOS);
-  const canAddMore = photos.length < MAX_PHOTOS;
-  // Pad only to the end of the current grid row, so the panel never shows a
-  // stranded half-row of empty frames.
-  const tiles = photos.length + (canAddMore ? 1 : 0);
-  const emptySlots = (3 - (tiles % 3)) % 3;
 
   return (
     <aside
@@ -147,55 +143,20 @@ export default function PersonPanel({
               {photos.length} of {MAX_PHOTOS}
             </span>
           </h4>
-          <div className="gallery">
-            {photos.map(({ photo: ph, live }, i) => {
-              const isNew = i >= approved.length;
-              return (
-                <figure key={`${ph.src}-${i}`}>
-                  <img
-                    src={ph.src}
-                    alt={ph.caption ?? person.name}
-                    loading="lazy"
-                  />
-                  {live && (
-                    <button
-                      className="photo-remove"
-                      onClick={() => onDeletePhoto(live)}
-                      aria-label={`Remove this photograph of ${person.name}`}
-                      title="Remove this photograph"
-                    >
-                      ×
-                    </button>
-                  )}
-                  {isNew && <span className="pending">Just added</span>}
-                  {ph.caption && <figcaption>{ph.caption}</figcaption>}
-                </figure>
-              );
-            })}
-
-            {canAddMore && (
-              <figure>
-                <button
-                  className="addslot"
-                  onClick={() => onContribute("photo")}
-                  aria-label={`Add a photograph of ${person.name}`}
-                >
-                  <span className="plus" aria-hidden="true">
-                    +
-                  </span>
-                  Add a photo
-                </button>
-              </figure>
-            )}
-            {Array.from({ length: emptySlots }).map((_, i) => (
-              <figure key={`slot-${i}`}>
-                <div className="placeholder" />
-              </figure>
-            ))}
-          </div>
+          <PhotoCarousel
+            // A new person or a new main photo starts back at the front.
+            key={`${person.id}|${primaryId ?? ""}`}
+            personName={person.name}
+            photos={photos}
+            primaryId={primaryId}
+            max={MAX_PHOTOS}
+            onSetPrimary={onSetPrimary}
+            onAdd={() => onContribute("photo")}
+          />
           <p className="note">
-            Up to five. A photograph goes up straight away — you will need the
-            family passcode, which keeps the door shut to everyone else.
+            Up to five. A photograph goes up straight away with the family
+            passcode, and stays: each one added uses up a spot for good. The
+            main photo is the one shown on their card in the tree.
           </p>
 
         </section>

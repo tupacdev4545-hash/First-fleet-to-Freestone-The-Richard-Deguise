@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { Layout } from "../lib/layout";
 import { CARD_H, CARD_W } from "../lib/layout";
 import { branchColor, initials, lifespan, wrap } from "../lib/person";
@@ -21,6 +21,8 @@ interface Props {
   /** People proposed this session, awaiting the archivist. */
   ghosts: GhostCard[];
   stageRef: React.RefObject<HTMLDivElement | null>;
+  /** The person's main photograph, shown in place of their initials. */
+  mainPhoto?: (id: string) => string | undefined;
 }
 
 const MIN_K = 0.02;
@@ -71,19 +73,30 @@ export default function TreeCanvas({
   onSelect,
   ghosts,
   stageRef,
+  mainPhoto,
 }: Props) {
-  const drag = useRef<{ id: number; x: number; y: number } | null>(null);
   /** Survives pointerup so the click handler can tell a drag from a tap. */
   const moved = useRef(false);
   /**
-   * Every finger currently down. The stage sets `touch-action: none`, which
-   * tells the browser we will handle pinching ourselves — so we have to.
+   * Every finger currently down, in stage coordinates. The stage sets
+   * `touch-action: none`, which tells the browser we handle pinching.
    */
-  const touches = useRef(new Map<number, { x: number; y: number }>());
-  /** The span and centre of a two-finger gesture, as it was last frame. */
-  const pinch = useRef<{ dist: number; cx: number; cy: number } | null>(null);
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  /**
+   * The camera, finger midpoint and finger span when the current gesture (or
+   * the current number of fingers) began. Every frame is worked out from this,
+   * not from the frame before, so small errors cannot pile up into drift.
+   */
+  const start = useRef<{ cam: Camera; mid: { x: number; y: number }; dist: number } | null>(null);
+  const downAt = useRef<{ x: number; y: number; t: number } | null>(null);
+  const captured = useRef(false);
   /** For double-tap to zoom, which is how most people zoom one-handed. */
   const lastTap = useRef<{ t: number; x: number; y: number } | null>(null);
+
+  const cameraRef = useRef(camera);
+  useLayoutEffect(() => {
+    cameraRef.current = camera;
+  }, [camera]);
 
   /** Pointer position relative to the stage, which is what the camera uses. */
   const local = useCallback(
@@ -106,16 +119,40 @@ export default function TreeCanvas({
     [onCamera],
   );
 
-  /** The two-finger span and midpoint, in stage coordinates. */
-  const gesture = () => {
-    const [a, b] = [...touches.current.values()];
-    const p = local(a.x, a.y);
-    const q = local(b.x, b.y);
-    return {
-      dist: Math.hypot(q.x - p.x, q.y - p.y),
-      cx: (p.x + q.x) / 2,
-      cy: (p.y + q.y) / 2,
+  /** Start measuring afresh from where the fingers are now. */
+  const rebaseline = () => {
+    const pts = [...pointers.current.values()];
+    if (!pts.length) {
+      start.current = null;
+      return;
+    }
+    const [a, b] = pts;
+    start.current = {
+      cam: { ...cameraRef.current },
+      mid: b ? { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } : a,
+      dist: b ? Math.hypot(a.x - b.x, a.y - b.y) : 0,
     };
+  };
+
+  /**
+   * Hold on to the fingers once a gesture is under way. Without this, zooming
+   * swaps the card drawings (see level of detail below), the element a finger
+   * landed on is deleted, and on iPhone that finger's "lifted" event never
+   * reaches the stage. The tree then believed a finger was still down, and the
+   * next touch pinched against that phantom point — the sudden zoom-outs.
+   * Not done on touch-down, because capturing then would steal the click from
+   * the person card underneath.
+   */
+  const capture = () => {
+    if (captured.current) return;
+    captured.current = true;
+    for (const id of pointers.current.keys()) {
+      try {
+        stageRef.current?.setPointerCapture(id);
+      } catch {
+        // That pointer has already gone.
+      }
+    }
   };
 
   const onWheel = useCallback(
@@ -127,7 +164,7 @@ export default function TreeCanvas({
       const px = e.clientX - rect.left;
       const py = e.clientY - rect.top;
       onCamera((c) => {
-        const factor = Math.exp(-e.deltaY * 0.0016);
+        const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0016));
         const k = Math.min(MAX_K, Math.max(MIN_K, c.k * factor));
         const ratio = k / c.k;
         return { k, x: px - (px - c.x) * ratio, y: py - (py - c.y) * ratio };
@@ -139,100 +176,107 @@ export default function TreeCanvas({
   useEffect(() => {
     const el = stageRef.current;
     if (!el) return;
+    // Safari's own pinch events, which would otherwise zoom the whole page.
+    const stopGesture = (e: Event) => e.preventDefault();
     el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
+    el.addEventListener("gesturestart", stopGesture);
+    el.addEventListener("gesturechange", stopGesture);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("gesturestart", stopGesture);
+      el.removeEventListener("gesturechange", stopGesture);
+    };
   }, [onWheel, stageRef]);
 
   const handlePointerDown = (e: React.PointerEvent) => {
-    if (e.button !== 0) return;
-    touches.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    // The first finger of a new touch. Anything still listed is a finger whose
+    // "lifted" event went missing — forget it rather than pinch against it.
+    if (e.isPrimary) {
+      pointers.current.clear();
+      captured.current = false;
+    }
+    const p = local(e.clientX, e.clientY);
+    pointers.current.set(e.pointerId, p);
 
-    if (touches.current.size === 2) {
+    if (pointers.current.size === 1) {
+      moved.current = false;
+      downAt.current = { ...p, t: performance.now() };
+      stageRef.current?.classList.add("dragging");
+    } else {
       // A second finger turns a drag into a pinch.
-      pinch.current = gesture();
-      drag.current = null;
       moved.current = true;
-      return;
+      capture();
     }
-
-    // Deliberately no setPointerCapture: capturing on the stage would retarget
-    // the click away from the person node underneath the cursor.
-    drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY };
-    moved.current = false;
-    stageRef.current?.classList.add("dragging");
-
-    // Double tap zooms in on the spot touched — the one-handed gesture.
-    if (e.pointerType !== "mouse") {
-      const now = performance.now();
-      const prev = lastTap.current;
-      if (
-        prev &&
-        now - prev.t < 320 &&
-        Math.hypot(e.clientX - prev.x, e.clientY - prev.y) < 34
-      ) {
-        const p = local(e.clientX, e.clientY);
-        zoomAbout(1.9, p.x, p.y);
-        moved.current = true;
-        lastTap.current = null;
-        return;
-      }
-      lastTap.current = { t: now, x: e.clientX, y: e.clientY };
-    }
+    rebaseline();
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
-    if (!touches.current.has(e.pointerId)) return;
-    touches.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (!pointers.current.has(e.pointerId)) return;
+    pointers.current.set(e.pointerId, local(e.clientX, e.clientY));
+    const s0 = start.current;
+    if (!s0) return;
 
-    // Two fingers: scale by how much the span changed, and pan by how far the
-    // midpoint travelled, so pinching and dragging work in the same motion.
-    if (touches.current.size >= 2) {
-      const was = pinch.current;
-      const now = gesture();
-      if (was && was.dist > 0) {
-        const factor = now.dist / was.dist;
-        onCamera((c) => {
-          const k = Math.min(MAX_K, Math.max(MIN_K, c.k * factor));
-          const ratio = k / c.k;
-          return {
-            k,
-            x: now.cx - (was.cx - c.x) * ratio,
-            y: now.cy - (was.cy - c.y) * ratio,
-          };
-        });
-      }
-      pinch.current = now;
+    const pts = [...pointers.current.values()];
+    if (!moved.current) {
+      const d = downAt.current;
+      if (d && Math.hypot(pts[0].x - d.x, pts[0].y - d.y) <= 4) return;
       moved.current = true;
+      capture();
+    }
+
+    if (pts.length === 1) {
+      onCamera({
+        ...s0.cam,
+        x: s0.cam.x + pts[0].x - s0.mid.x,
+        y: s0.cam.y + pts[0].y - s0.mid.y,
+      });
       return;
     }
 
-    const d = drag.current;
-    if (!d || d.id !== e.pointerId) return;
-    const dx = e.clientX - d.x;
-    const dy = e.clientY - d.y;
-    if (Math.abs(dx) + Math.abs(dy) > 3) moved.current = true;
-    d.x = e.clientX;
-    d.y = e.clientY;
-    onCamera((c) => ({ ...c, x: c.x + dx, y: c.y + dy }));
+    // Two fingers: scale by the span against where it started, and keep the
+    // spot that was under the fingers under them, so pinching and dragging
+    // work in the same motion.
+    if (s0.dist < 12) {
+      rebaseline();
+      return;
+    }
+    const [a, b] = pts;
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    const k = Math.min(MAX_K, Math.max(MIN_K, s0.cam.k * (dist / s0.dist)));
+    const wx = (s0.mid.x - s0.cam.x) / s0.cam.k;
+    const wy = (s0.mid.y - s0.cam.y) / s0.cam.k;
+    onCamera({ k, x: mid.x - wx * k, y: mid.y - wy * k });
   };
 
-  const endDrag = (e: React.PointerEvent) => {
-    touches.current.delete(e.pointerId);
-    if (touches.current.size < 2) pinch.current = null;
+  const release = (e: React.PointerEvent, tapAllowed: boolean) => {
+    if (!pointers.current.delete(e.pointerId)) return;
 
-    // Lifting one finger of a pinch hands control back to the one still down,
-    // rather than jumping the tree by the gap between them.
-    if (touches.current.size === 1) {
-      const [id] = [...touches.current.keys()];
-      const p = touches.current.get(id)!;
-      drag.current = { id, x: p.x, y: p.y };
-      return;
-    }
-
-    if (drag.current?.id === e.pointerId) drag.current = null;
-    if (touches.current.size === 0) {
+    if (pointers.current.size === 0) {
+      captured.current = false;
       stageRef.current?.classList.remove("dragging");
+
+      // Double tap zooms in on the spot touched. Judged on lift, so the first
+      // finger of a quick second pinch is never mistaken for a tap.
+      const d = downAt.current;
+      const now = performance.now();
+      if (tapAllowed && !moved.current && e.pointerType !== "mouse" && d && now - d.t < 300) {
+        const prev = lastTap.current;
+        if (prev && now - prev.t < 350 && Math.hypot(d.x - prev.x, d.y - prev.y) < 34) {
+          zoomAbout(1.9, d.x, d.y);
+          moved.current = true;
+          lastTap.current = null;
+        } else {
+          lastTap.current = { t: now, x: d.x, y: d.y };
+        }
+      } else {
+        lastTap.current = null;
+      }
     }
+    // Lifting one finger of a pinch hands control to the one still down,
+    // measured from here, so the tree does not jump.
+    rebaseline();
   };
 
   // Level of detail. Names are unreadable much below half scale, and 220 sets
@@ -283,9 +327,12 @@ export default function TreeCanvas({
       ref={stageRef}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
-      onPointerLeave={endDrag}
+      onPointerUp={(e) => release(e, true)}
+      onPointerCancel={(e) => release(e, false)}
+      onLostPointerCapture={(e) => release(e, false)}
+      onPointerLeave={(e) => {
+        if (e.pointerType === "mouse") release(e, false);
+      }}
     >
       <svg role="presentation">
         <g transform={`translate(${camera.x} ${camera.y}) scale(${camera.k})`}>
@@ -358,14 +405,38 @@ export default function TreeCanvas({
                             r={23}
                             stroke={colour}
                           />
-                          <text
-                            className="initials"
-                            x={38}
-                            y={CARD_H / 2 + 1}
-                            fill={colour}
-                          >
-                            {initials(person.name)}
-                          </text>
+                          {(() => {
+                            const src = mainPhoto?.(person.id);
+                            if (!src) {
+                              return (
+                                <text
+                                  className="initials"
+                                  x={38}
+                                  y={CARD_H / 2 + 1}
+                                  fill={colour}
+                                >
+                                  {initials(person.name)}
+                                </text>
+                              );
+                            }
+                            const clip = `av-${person.id.replace(/[^\w-]/g, "_")}`;
+                            return (
+                              <>
+                                <clipPath id={clip}>
+                                  <circle cx={38} cy={CARD_H / 2} r={22} />
+                                </clipPath>
+                                <image
+                                  href={src}
+                                  x={16}
+                                  y={CARD_H / 2 - 22}
+                                  width={44}
+                                  height={44}
+                                  preserveAspectRatio="xMidYMid slice"
+                                  clipPath={`url(#${clip})`}
+                                />
+                              </>
+                            );
+                          })()}
                         </>
                       )}
                       {rows.map((r, i) => (

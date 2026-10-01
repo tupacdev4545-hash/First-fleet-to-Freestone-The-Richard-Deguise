@@ -25,6 +25,9 @@ SITE_URL="$(out SiteUrl)"
 echo "==> Packaging Lambda"
 rm -f /tmp/submit.zip
 (cd api && zip -qr /tmp/submit.zip index.mjs)
+# The record rides along so the API can count existing photographs and check
+# where a new relative can hang.
+zip -qj /tmp/submit.zip src/data/tree.json
 aws lambda update-function-code \
   --function-name "${STACK}-submit" \
   --zip-file fileb:///tmp/submit.zip \

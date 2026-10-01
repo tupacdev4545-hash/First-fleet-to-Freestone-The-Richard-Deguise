@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { DynamoDBClient, PutItemCommand, ScanCommand, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { SESv2Client, SendEmailCommand } from "@aws-sdk/client-sesv2";
@@ -17,6 +18,25 @@ const REGION = process.env.AWS_REGION ?? "ap-southeast-2";
 
 /** Photographs live here, inside the site bucket, so the CDN serves them. */
 const LIVE_PREFIX = "photos/live";
+/** Photographs per person, counting the ones already in the record. */
+const MAX_PHOTOS = 5;
+
+/**
+ * The deployed record, shipped inside the Lambda zip by deploy.sh. Used to
+ * count each person's existing photographs and to check where a new relative
+ * can hang before the archivist approves them.
+ */
+let RECORD = { people: [], unions: [] };
+try {
+  RECORD = JSON.parse(readFileSync(new URL("./tree.json", import.meta.url), "utf8"));
+} catch {
+  // Older zips had no tree.json. Everything below degrades to "no record".
+}
+const recordPerson = (id) => RECORD.people.find((p) => p.id === id);
+const recordPhotos = (id) => recordPerson(id)?.photos ?? [];
+
+/** The API as the archivist's emails reach it — through the site's domain. */
+const API_BASE = SITE_URL ? `${SITE_URL}/api` : "";
 const GALLERY_KEY = "gallery.json";
 
 // No CORS headers here on purpose. The Function URL's own Cors block answers
@@ -170,6 +190,17 @@ function passcodeOk(given) {
 const removalToken = (id) =>
   createHmac("sha256", `${ADMIN_EMAIL}:${PASSCODE}`).update(id).digest("hex").slice(0, 32);
 
+/** Signs the archivist's "Add to the tree" links. Separate from removal. */
+const approveToken = (id) => removalToken(`approve:${id}`);
+
+const tokenOk = (given, want) =>
+  typeof given === "string" &&
+  given.length === want.length &&
+  timingSafeEqual(Buffer.from(given), Buffer.from(want));
+
+const approveUrl = (id) => `${API_BASE}/approve?id=${encodeURIComponent(id)}&t=${approveToken(id)}`;
+const removeUrlFor = (id, base = API_BASE) => `${base}/remove?id=${encodeURIComponent(id)}&t=${removalToken(id)}`;
+
 function readBody(event) {
   const raw = event.isBase64Encoded
     ? Buffer.from(event.body ?? "", "base64").toString("utf8")
@@ -193,6 +224,250 @@ const RELATIONSHIP_WORDS = {
   sibling: "a sibling of",
 };
 
+/* ------------------------------------------------------------ the table -- */
+
+/** Every row matching a filter. The table is small; a scan is fine. */
+async function scanAll(params = {}) {
+  const items = [];
+  let ExclusiveStartKey;
+  do {
+    const res = await ddb.send(new ScanCommand({ TableName: TABLE, ExclusiveStartKey, ...params }));
+    items.push(...(res.Items ?? []));
+    ExclusiveStartKey = res.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return items;
+}
+
+async function getRow(id) {
+  const rows = await scanAll({
+    FilterExpression: "#id = :id",
+    ExpressionAttributeNames: { "#id": "id" },
+    ExpressionAttributeValues: { ":id": { S: id } },
+  });
+  return rows[0];
+}
+
+const isConditionFail = (e) => e?.name === "ConditionalCheckFailedException";
+
+/* ---------------------------------------------------------- photo slots -- */
+// Each person has MAX_PHOTOS spots, less whatever the record already holds.
+// A counter row per person ("slots#<id>") is claimed with a conditional write,
+// so two people uploading at the same moment cannot go past the limit. Only
+// the archivist's take-down link gives a spot back.
+
+const slotKey = (pid) => ({ id: { S: `slots#${pid}` } });
+const allowedFor = (pid) => Math.max(0, MAX_PHOTOS - recordPhotos(pid).length);
+
+/** The first time a person is seen, start their counter at what is live. */
+async function seedSlots(pid) {
+  const live = await scanAll({
+    FilterExpression: "#k = :photo AND #s = :live AND personId = :pid",
+    ExpressionAttributeNames: { "#k": "kind", "#s": "status" },
+    ExpressionAttributeValues: {
+      ":photo": { S: "photo" }, ":live": { S: "live" }, ":pid": { S: pid },
+    },
+  });
+  await ddb
+    .send(
+      new UpdateItemCommand({
+        TableName: TABLE,
+        Key: slotKey(pid),
+        UpdateExpression: "SET used = :n, #k = :slots, personId = :pid",
+        ConditionExpression: "attribute_not_exists(id)",
+        ExpressionAttributeNames: { "#k": "kind" },
+        ExpressionAttributeValues: {
+          ":n": { N: String(live.length) }, ":slots": { S: "slots" }, ":pid": { S: pid },
+        },
+      }),
+    )
+    .catch((e) => {
+      if (!isConditionFail(e)) throw e;
+    });
+}
+
+/** True if a spot is free. Checks only; does not take it. */
+async function slotFree(pid) {
+  await seedSlots(pid);
+  try {
+    await ddb.send(
+      new UpdateItemCommand({
+        TableName: TABLE,
+        Key: slotKey(pid),
+        UpdateExpression: "SET checkedAt = :now",
+        ConditionExpression: "used < :allowed",
+        ExpressionAttributeValues: {
+          ":now": { S: new Date().toISOString() },
+          ":allowed": { N: String(allowedFor(pid)) },
+        },
+      }),
+    );
+    return true;
+  } catch (e) {
+    if (isConditionFail(e)) return false;
+    throw e;
+  }
+}
+
+/** Take a spot for good. False if they are all used. */
+async function claimSlot(pid) {
+  await seedSlots(pid);
+  try {
+    await ddb.send(
+      new UpdateItemCommand({
+        TableName: TABLE,
+        Key: slotKey(pid),
+        UpdateExpression: "ADD used :one",
+        ConditionExpression: "used < :allowed",
+        ExpressionAttributeValues: {
+          ":one": { N: "1" },
+          ":allowed": { N: String(allowedFor(pid)) },
+        },
+      }),
+    );
+    return true;
+  } catch (e) {
+    if (isConditionFail(e)) return false;
+    throw e;
+  }
+}
+
+async function releaseSlot(pid) {
+  await ddb
+    .send(
+      new UpdateItemCommand({
+        TableName: TABLE,
+        Key: slotKey(pid),
+        UpdateExpression: "ADD used :minus",
+        ConditionExpression: "used > :zero",
+        ExpressionAttributeValues: { ":minus": { N: "-1" }, ":zero": { N: "0" } },
+      }),
+    )
+    .catch((e) => {
+      if (!isConditionFail(e)) throw e;
+    });
+}
+
+/* ------------------------------------------------------ adding a person -- */
+
+/**
+ * Why a proposed relative cannot be placed yet, or null if they can. Checks
+ * the record plus anyone the family has already added.
+ */
+function placementProblem(row, liveRelatives) {
+  const pid = row.personId?.S;
+  const rel = row.relationship?.S ?? "child";
+  const name = row.personName?.S ?? "This person";
+  const parentUnion = RECORD.unions.find((u) => u.children.includes(pid));
+  const liveParents = liveRelatives.filter(
+    (r) => r.personId?.S === pid && r.relationship?.S === "parent",
+  ).length;
+  const parentChildOfLive = liveRelatives.some(
+    (r) => r.relationship?.S === "child" && `live-${r.id.S}` === pid,
+  );
+  if (rel === "sibling" && !parentUnion && !liveParents && !parentChildOfLive) {
+    return `${name} has no parents on the tree yet, so a sibling has nowhere to hang. Add a parent of ${name} first, then the sibling.`;
+  }
+  if (rel === "parent" && (parentUnion?.partners.length ?? 0) + liveParents >= 2) {
+    return `${name} already has two parents on the tree.`;
+  }
+  return null;
+}
+
+/** The archivist's confirm page: the details, and one button. */
+function approvePage(statusCode, title, inner) {
+  return {
+    statusCode,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "referrer-policy": "no-referrer",
+      "x-robots-tag": "noindex",
+    },
+    body: `<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escape(title)}</title>
+<style>
+ body{font-family:ui-serif,Georgia,serif;background:#fbf9f5;color:#201a14;margin:0;padding:24px;
+      display:grid;place-items:center;min-height:100vh;box-sizing:border-box}
+ main{max-width:32rem;width:100%}
+ h1{font-size:1.6rem;font-weight:normal;line-height:1.25;margin:0 0 1.25rem}
+ dl{display:grid;grid-template-columns:auto 1fr;gap:.45rem 1.25rem;margin:0 0 1.5rem;
+    padding:1rem 0;border-block:1px solid #ddd3c2}
+ dt{color:#8a7c6c} dd{margin:0}
+ .warn{border:1px solid #cdbfa9;background:#f7f1e6;border-radius:10px;padding:12px 14px;margin:0 0 1.25rem;
+       font-size:.95rem;line-height:1.5}
+ .stop{border-color:#e0b8a8;background:#fbf1ec}
+ button{font:inherit;font-size:1.05rem;width:100%;padding:.85rem;border:0;border-radius:8px;
+        background:#2f5d3a;color:#fff;cursor:pointer}
+ button[disabled]{opacity:.6;cursor:default}
+ button:focus-visible,a:focus-visible{outline:3px solid #9cc3a6;outline-offset:2px}
+ p{color:#574d42;line-height:1.6;font-size:.95rem}
+ a{color:#8c2f16}
+</style>
+<main><h1>${escape(title)}</h1>${inner}
+${SITE_URL ? `<p><a href="${escape(SITE_URL)}">Open the family tree</a></p>` : ""}</main></html>`,
+  };
+}
+
+function relativeDetails(row) {
+  const v = (k) => row[k]?.S;
+  const rows = [
+    ["Adding", `<strong>${escape(v("newPersonName"))}</strong> as ${escape(RELATIONSHIP_WORDS[v("relationship")] ?? v("relationship") ?? "")} ${escape(v("personName") ?? "")}`],
+    v("newPerson_born") && ["Born", escape(v("newPerson_born"))],
+    v("newPerson_bornPlace") && ["Born at", escape(v("newPerson_bornPlace"))],
+    v("newPerson_died") && ["Died", escape(v("newPerson_died"))],
+    v("newPerson_blurb") && ["About them", escape(v("newPerson_blurb"))],
+    v("notes") && ["Notes", escape(v("notes"))],
+    ["Sent by", `${escape(v("submitterName") ?? "")} &lt;${escape(v("submitterEmail") ?? "")}&gt;`],
+  ].filter(Boolean);
+  return `<dl>${rows.map(([k, val]) => `<dt>${k}</dt><dd>${val}</dd>`).join("")}</dl>`;
+}
+
+/** Re-send approve buttons for everything still waiting. */
+async function resendPending() {
+  const pending = await scanAll({
+    FilterExpression: "#k = :rel AND #s = :pending",
+    ExpressionAttributeNames: { "#k": "kind", "#s": "status" },
+    ExpressionAttributeValues: { ":rel": { S: "relative" }, ":pending": { S: "pending" } },
+  });
+  if (!pending.length) return { sent: 0 };
+  const blocks = pending
+    .sort((a, b) => (a.createdAt?.S ?? "").localeCompare(b.createdAt?.S ?? ""))
+    .map(
+      (r) => `<div style="border-top:1px solid #ddd3c2;padding:14px 0">
+        <p style="margin:0 0 8px"><strong>${escape(r.newPersonName?.S ?? "")}</strong> as ${escape(
+          RELATIONSHIP_WORDS[r.relationship?.S] ?? r.relationship?.S ?? "",
+        )} ${escape(r.personName?.S ?? "")} <span style="color:#8a7c6c">· from ${escape(r.submitterName?.S ?? "")}</span></p>
+        ${approveButton(r.id.S)}
+      </div>`,
+    )
+    .join("");
+  await ses.send(
+    new SendEmailCommand({
+      FromEmailAddress: ADMIN_EMAIL,
+      Destination: { ToAddresses: [ADMIN_EMAIL] },
+      Content: {
+        Simple: {
+          Subject: { Data: `Family tree — ${pending.length} ${pending.length === 1 ? "person" : "people"} waiting to be added`, Charset: "UTF-8" },
+          Body: {
+            Html: {
+              Data: `<div style="font-family:system-ui,sans-serif;font-size:14px;color:#241d16;max-width:640px">
+<h2 style="margin:0 0 8px">Waiting to be added</h2>${blocks}</div>`,
+              Charset: "UTF-8",
+            },
+          },
+        },
+      },
+    }),
+  );
+  return { sent: pending.length };
+}
+
+function approveButton(id) {
+  return `<a href="${escape(approveUrl(id))}" target="_blank" rel="noopener"
+    style="display:inline-block;padding:11px 18px;background:#2f5d3a;color:#fff;border-radius:8px;text-decoration:none">Add to the tree</a>`;
+}
+
 /* ------------------------------------------------------------- gallery ---- */
 
 /**
@@ -202,21 +477,11 @@ const RELATIONSHIP_WORDS = {
  * lose each other's work.
  */
 async function rebuildGallery() {
-  const items = [];
-  let ExclusiveStartKey;
-  do {
-    const res = await ddb.send(
-      new ScanCommand({
-        TableName: TABLE,
-        FilterExpression: "#s = :live",
-        ExpressionAttributeNames: { "#s": "status" },
-        ExpressionAttributeValues: { ":live": { S: "live" } },
-        ExclusiveStartKey,
-      }),
-    );
-    items.push(...(res.Items ?? []));
-    ExclusiveStartKey = res.LastEvaluatedKey;
-  } while (ExclusiveStartKey);
+  const items = await scanAll({
+    FilterExpression: "#s = :live",
+    ExpressionAttributeNames: { "#s": "status" },
+    ExpressionAttributeValues: { ":live": { S: "live" } },
+  });
 
   const byDate = (a, b) => (a.at ?? "").localeCompare(b.at ?? "");
 
@@ -249,6 +514,32 @@ async function rebuildGallery() {
   }
   const stories = [...latest.values()].sort(byDate);
 
+  // People the archivist has approved. The browser hangs them on the tree.
+  const relatives = items
+    .filter((i) => i.kind?.S === "relative" && i.newPersonName?.S && i.personId?.S)
+    .map((i) => ({
+      id: `live-${i.id.S}`,
+      personId: i.personId.S,
+      relationship: i.relationship?.S ?? "child",
+      otherParentId: i.otherParentId?.S,
+      name: i.newPersonName.S,
+      born: i.newPerson_born?.S,
+      died: i.newPerson_died?.S,
+      bornPlace: i.newPerson_bornPlace?.S,
+      blurb: i.newPerson_blurb?.S,
+      by: i.submitterName?.S,
+      at: i.approvedAt?.S ?? i.createdAt?.S,
+    }))
+    .sort(byDate);
+
+  // Each person's chosen main photograph: a live photo id or a record src.
+  const primary = {};
+  for (const i of items) {
+    if (i.kind?.S === "primary" && i.personId?.S && i.photoId?.S) {
+      primary[i.personId.S] = i.photoId.S;
+    }
+  }
+
   await s3.send(
     new PutObjectCommand({
       Bucket: SITE_BUCKET,
@@ -257,18 +548,26 @@ async function rebuildGallery() {
         updated: new Date().toISOString(),
         photos,
         stories,
+        relatives,
+        primary,
       }),
       ContentType: "application/json",
       CacheControl: "no-cache, must-revalidate",
     }),
   );
 
-  return { photos: photos.length, stories: stories.length };
+  return { photos: photos.length, stories: stories.length, relatives: relatives.length };
 }
 
 /* ----------------------------------------------------------- the handler -- */
 
 export const handler = async (event) => {
+  // Only reachable with `aws lambda invoke` (scripts/resend-pending.sh). A
+  // Function URL request never carries a top-level "source".
+  if (event?.source === "deguise.resend-pending") {
+    return resendPending();
+  }
+
   const method =
     event?.requestContext?.http?.method ?? event?.httpMethod ?? "POST";
   const path = event?.rawPath ?? event?.requestContext?.http?.path ?? "/";
@@ -294,13 +593,19 @@ export const handler = async (event) => {
           TableName: TABLE,
           Key: { id: { S: id } },
           UpdateExpression: "SET #s = :removed",
+          ConditionExpression: "attribute_exists(id)",
           ExpressionAttributeNames: { "#s": "status" },
           ExpressionAttributeValues: { ":removed": { S: "removed" } },
-          ReturnValues: "ALL_NEW",
+          ReturnValues: "ALL_OLD",
         }),
       );
       key = res.Attributes?.storageKey?.S ?? "";
       kind = res.Attributes?.kind?.S ?? "photo";
+      // A photograph coming down gives its spot back — once, however many
+      // times the link is clicked.
+      if (kind === "photo" && res.Attributes?.status?.S === "live" && res.Attributes?.personId?.S) {
+        await releaseSlot(res.Attributes.personId.S);
+      }
     } catch {
       return page(404, "Not found", "That contribution is not in the archive.");
     }
@@ -313,10 +618,75 @@ export const handler = async (event) => {
     return page(
       200,
       "Taken down",
-      kind === "biography"
+      kind === "relative"
+        ? "They are off the tree. The proposal is kept in the archive, so it can be approved again later."
+        : kind === "biography"
         ? "The story is off the tree. If someone had written an earlier one for that person it comes back; otherwise the record reads as it did before. It may linger in the CDN cache for a few minutes."
         : "The photograph is gone from the tree and deleted from storage. It may linger in the CDN cache for a few minutes.",
     );
+  }
+
+  /* --- the archivist's confirm page for adding a person --- */
+  if (method === "GET" && path.endsWith("/approve")) {
+    const id = str(qs.id, 80);
+    if (!id || !tokenOk(qs.t, approveToken(id))) {
+      return approvePage(403, "This link doesn't work", "<p>It is incomplete, or the family passcode has been changed since it was sent. Run <code>./scripts/resend-pending.sh</code> for fresh links.</p>");
+    }
+    const row = await getRow(id);
+    if (!row || row.kind?.S !== "relative") {
+      return approvePage(404, "Not found", "<p>There is no proposed person with this id.</p>");
+    }
+    const name = row.newPersonName?.S ?? "This person";
+    if (row.status?.S === "live") {
+      return approvePage(200, `${name} is already on the tree`, `${relativeDetails(row)}<p>Nothing more to do.</p>`);
+    }
+    if (row.status?.S === "removed") {
+      return approvePage(200, `${name} was taken down`, `${relativeDetails(row)}<p>This was approved and later removed. Ask the family member to send it again if they should go back.</p>`);
+    }
+    const liveRelatives = await scanAll({
+      FilterExpression: "#k = :rel AND #s = :live",
+      ExpressionAttributeNames: { "#k": "kind", "#s": "status" },
+      ExpressionAttributeValues: { ":rel": { S: "relative" }, ":live": { S: "live" } },
+    });
+    const problem = placementProblem(row, liveRelatives);
+    const also = row.alsoRecordedWith?.SS ?? [];
+    const checks = [
+      also.length &&
+        `<div class="warn"><strong>Check this one privately.</strong> ${escape(row.personName?.S ?? "")} is already recorded with ${escape(also.join(" and "))}. Confirm which partnership is current before adding.</div>`,
+      row.displacesName?.S &&
+        `<div class="warn"><strong>This changes a partnership.</strong> ${escape(row.personName?.S ?? "")} is recorded with ${escape(row.displacesName.S)}. Contributor says: ${escape(OUTCOME_WORDS[row.displacesOutcome?.S] ?? row.displacesOutcome?.S ?? "unspecified")}.</div>`,
+    ].filter(Boolean).join("");
+    if (problem) {
+      return approvePage(200, `${name} can't be added yet`, `${relativeDetails(row)}<div class="warn stop">${escape(problem)}</div>`);
+    }
+    return approvePage(200, `Add ${name} to the tree?`, `${relativeDetails(row)}${checks}
+<button id="go" type="button">Add to the tree</button>
+<p id="msg">They appear on the site for everyone straight away. The email's take-down link still removes them.</p>
+<script>
+const go = document.getElementById("go"), msg = document.getElementById("msg");
+go.addEventListener("click", async () => {
+  go.disabled = true; go.textContent = "Adding…";
+  const body = JSON.stringify({ id: ${JSON.stringify(id)}, t: ${JSON.stringify(String(qs.t))} });
+  const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)))]
+    .map((b) => b.toString(16).padStart(2, "0")).join("");
+  try {
+    const res = await fetch(location.pathname, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-amz-content-sha256": hash },
+      body,
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(out.error || "Something went wrong (" + res.status + ")");
+    document.querySelector("h1").textContent = out.name + " has been added";
+    go.remove();
+    msg.innerHTML = "They are on the tree now. Reload the site to see them. " +
+      '<a href="' + out.removeUrl + '">Take it down</a> if that was a mistake.';
+  } catch (e) {
+    go.disabled = false; go.textContent = "Add to the tree";
+    msg.textContent = e.message;
+  }
+});
+</script>`);
   }
 
   if (method !== "POST") return reply(405, { error: "Method not allowed" });
@@ -339,6 +709,10 @@ export const handler = async (event) => {
     if (!ALLOWED_IMAGE.has(fileType)) {
       return reply(415, { error: "That image format is not accepted" });
     }
+    const forPerson = str(input.personId, 120);
+    if (forPerson && !(await slotFree(forPerson))) {
+      return reply(409, { error: `All ${MAX_PHOTOS} photo spots for this person are used.` });
+    }
     const key = `${LIVE_PREFIX}/${randomUUID()}.${EXT[fileType] ?? "bin"}`;
     return reply(200, {
       key,
@@ -347,45 +721,88 @@ export const handler = async (event) => {
     });
   }
 
-  /* --- taking a photograph down from inside the site --- */
+  /* --- photographs are permanent once added --- */
+  // Only the archivist's take-down link can remove one. This endpoint stays
+  // so an old cached page gets a clear answer rather than a 404.
   if (path.endsWith("/delete-photo")) {
-    if (!passcodeOk(input.passcode)) {
-      return reply(401, { error: "That family passcode is not right." });
-    }
-    const id = str(input.id, 80);
-    if (!id) return reply(400, { error: "Which photograph?" });
+    return reply(410, { error: "Photographs stay once they are added. Ask the archivist if one needs to come down." });
+  }
 
-    let key = "";
+  /* --- approving a person from the confirm page --- */
+  if (path.endsWith("/approve")) {
+    const id = str(input.id, 80);
+    if (!id || !tokenOk(input.t, approveToken(id))) {
+      return reply(403, { error: "That link is not valid any more." });
+    }
+    const row = await getRow(id);
+    if (!row || row.kind?.S !== "relative") return reply(404, { error: "Not found" });
+    const name = row.newPersonName?.S ?? "They";
+    if (row.status?.S === "live") {
+      return reply(200, { ok: true, name, removeUrl: removeUrlFor(id) });
+    }
+    const liveRelatives = await scanAll({
+      FilterExpression: "#k = :rel AND #s = :live",
+      ExpressionAttributeNames: { "#k": "kind", "#s": "status" },
+      ExpressionAttributeValues: { ":rel": { S: "relative" }, ":live": { S: "live" } },
+    });
+    const problem = placementProblem(row, liveRelatives);
+    if (problem) return reply(409, { error: problem });
     try {
-      const res = await ddb.send(
+      await ddb.send(
         new UpdateItemCommand({
           TableName: TABLE,
           Key: { id: { S: id } },
-          UpdateExpression: "SET #s = :removed",
-          // Only ever touch a row that is a live photograph. Without this a
-          // crafted id could mark a pending relative as removed.
-          ConditionExpression: "#k = :photo AND #s = :live",
+          UpdateExpression: "SET #s = :live, approvedAt = :now",
+          ConditionExpression: "#k = :rel AND #s = :pending",
           ExpressionAttributeNames: { "#s": "status", "#k": "kind" },
           ExpressionAttributeValues: {
-            ":removed": { S: "removed" },
-            ":photo": { S: "photo" },
             ":live": { S: "live" },
+            ":pending": { S: "pending" },
+            ":rel": { S: "relative" },
+            ":now": { S: new Date().toISOString() },
           },
-          ReturnValues: "ALL_NEW",
         }),
       );
-      key = res.Attributes?.storageKey?.S ?? "";
-    } catch {
-      return reply(404, { error: "That photograph is not on the tree." });
+    } catch (e) {
+      if (!isConditionFail(e)) throw e;
+      return reply(409, { error: "This one was taken down. Ask for it to be sent again." });
     }
+    await rebuildGallery();
+    return reply(200, { ok: true, name, removeUrl: removeUrlFor(id) });
+  }
 
-    if (key) {
-      await s3
-        .send(new DeleteObjectCommand({ Bucket: SITE_BUCKET, Key: key }))
-        .catch(() => {});
+  /* --- choosing a person's main photograph --- */
+  if (path.endsWith("/primary")) {
+    if (!passcodeOk(input.passcode)) {
+      return reply(401, { error: "That family passcode is not right." });
     }
-    const counts = await rebuildGallery();
-    return reply(200, { ok: true, photos: counts.photos });
+    const personId = str(input.personId, 120);
+    const photoId = str(input.photoId, 400);
+    if (!personId || !photoId) return reply(400, { error: "Which photograph?" });
+
+    let ok = recordPhotos(personId).some((p) => p.src === photoId);
+    if (!ok) {
+      const row = await getRow(photoId);
+      ok = row?.kind?.S === "photo" && row.status?.S === "live" && row.personId?.S === personId;
+    }
+    if (!ok) return reply(400, { error: "That photograph does not belong to this person." });
+
+    await ddb.send(
+      new PutItemCommand({
+        TableName: TABLE,
+        Item: {
+          id: { S: `primary#${personId}` },
+          kind: { S: "primary" },
+          status: { S: "live" },
+          personId: { S: personId },
+          photoId: { S: photoId },
+          createdAt: { S: new Date().toISOString() },
+          sourceIp: { S: sourceIp },
+        },
+      }),
+    );
+    await rebuildGallery();
+    return reply(200, { ok: true, personId, photoId });
   }
 
   if (!path.endsWith("/proposals") && !path.endsWith("/submissions")) {
@@ -460,6 +877,12 @@ export const handler = async (event) => {
       if (!storageKey || !publicPath || !storageKey.startsWith(`${LIVE_PREFIX}/`)) {
         return reply(400, { error: "The upload did not complete" });
       }
+      if (!(await claimSlot(personId))) {
+        await s3
+          .send(new DeleteObjectCommand({ Bucket: SITE_BUCKET, Key: storageKey }))
+          .catch(() => {});
+        return reply(409, { error: `All ${MAX_PHOTOS} photo spots for this person are used.` });
+      }
       item.storageKey = { S: storageKey };
       item.publicPath = { S: publicPath };
       const caption = str(input.caption, 400);
@@ -494,6 +917,8 @@ export const handler = async (event) => {
         if (v) item[`newPerson_${f}`] = { S: v };
       }
       if (str(input.notes, 2000)) item.notes = { S: input.notes.trim() };
+      const otherParentId = str(input.otherParentId, 120);
+      if (otherParentId) item.otherParentId = { S: otherParentId };
 
       rows = `<tr><td>Adding</td><td><strong>${escape(name)}</strong> as ${escape(
         RELATIONSHIP_WORDS[rel] ?? rel,
@@ -573,7 +998,10 @@ ${rows}
 ${
   live
     ? ""
-    : `<p style="margin-top:20px;color:#8a7c6c">Approve it by editing <code>src/data/tree.json</code> and running <code>./scripts/deploy.sh</code>. Pending list: <code>./scripts/submissions.sh</code></p>`
+    : kind === "relative"
+      ? `<p style="margin:20px 0 8px">${approveButton(id)}</p>
+         <p style="margin:0;color:#8a7c6c">Opens a page where you confirm. Nothing changes until you press the button there.</p>`
+      : `<p style="margin-top:20px;color:#8a7c6c">Waiting on approval. Pending list: <code>./scripts/submissions.sh</code></p>`
 }
 <p><a href="${escape(SITE_URL)}">${escape(SITE_URL)}</a></p>
 </div>`;

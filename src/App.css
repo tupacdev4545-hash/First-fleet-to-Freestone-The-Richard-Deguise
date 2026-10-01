@@ -1368,3 +1368,143 @@
   text-align: center;
   text-decoration: none;
 }
+
+/* ---------- photo carousel ---------- */
+
+.pc {
+  display: grid;
+  gap: 8px;
+}
+
+.pc-stage {
+  position: relative;
+  aspect-ratio: 4 / 5;
+  max-height: 46vh;
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  overflow: hidden;
+  touch-action: pan-y;
+}
+
+.pc-stage img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.pc-tag {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 11px;
+  background: var(--accent);
+  color: #fff;
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+
+.pc-tag.pc-new {
+  left: auto;
+  right: 8px;
+  background: var(--ink-2);
+}
+
+.pc-arrow {
+  position: absolute;
+  top: 50%;
+  translate: 0 -50%;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--ink);
+  font-size: 22px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+
+.pc-prev { left: 8px; }
+.pc-next { right: 8px; }
+
+.pc-caption {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-2);
+  line-height: 1.4;
+}
+
+.pc-strip {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.pc-thumb {
+  flex: 0 0 52px;
+  height: 64px;
+  padding: 0;
+  border-radius: 7px;
+  border: 2px solid transparent;
+  background: var(--surface-2);
+  overflow: hidden;
+  position: relative;
+}
+
+.pc-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.pc-thumb.on {
+  border-color: var(--ink);
+}
+
+.pc-thumb.main::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 4px;
+  background: var(--accent);
+}
+
+.pc-add {
+  border: 1.5px dashed color-mix(in srgb, var(--ring) 55%, var(--line));
+  color: var(--accent);
+  font-size: 22px;
+  font-weight: 300;
+}
+
+.pc-first {
+  aspect-ratio: auto;
+  padding: 22px 12px;
+}
+
+.pc-pass {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.pc-pass input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.pc-error {
+  color: var(--accent);
+}

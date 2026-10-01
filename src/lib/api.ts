@@ -99,12 +99,31 @@ export interface LiveStory {
   at?: string;
 }
 
+/** Someone the archivist approved, to be hung on the tree before layout. */
+export interface LiveRelative {
+  id: string;
+  /** Who they were added next to. */
+  personId: string;
+  relationship: "child" | "parent" | "partner" | "sibling";
+  otherParentId?: string;
+  name: string;
+  born?: string;
+  died?: string;
+  bornPlace?: string;
+  blurb?: string;
+  by?: string;
+  at?: string;
+}
+
 export interface Overlay {
   photos: LivePhoto[];
   stories: LiveStory[];
+  relatives: LiveRelative[];
+  /** personId -> the chosen main photo (a live photo id, or a record src). */
+  primary: Record<string, string>;
 }
 
-const EMPTY: Overlay = { photos: [], stories: [] };
+const EMPTY: Overlay = { photos: [], stories: [], relatives: [], primary: {} };
 
 /**
  * Everything the family has published since the last deploy. Written by the
@@ -119,6 +138,9 @@ export async function fetchOverlay(): Promise<Overlay> {
     return {
       photos: Array.isArray(data.photos) ? data.photos : [],
       stories: Array.isArray(data.stories) ? data.stories : [],
+      relatives: Array.isArray(data.relatives) ? data.relatives : [],
+      primary:
+        data.primary && typeof data.primary === "object" ? data.primary : {},
     };
   } catch {
     // No overlay yet, or offline. The tree still works.
@@ -133,14 +155,19 @@ export async function fetchOverlay(): Promise<Overlay> {
 async function uploadPhoto(
   file: File,
   passcode: string,
+  personId: string,
 ): Promise<{ key: string; publicPath: string }> {
   const res = await postJson("/upload-url", {
     fileName: file.name,
     fileType: file.type,
+    personId,
     passcode,
   });
   if (res.status === 401) {
     throw new SubmitError("That family passcode is not right.");
+  }
+  if (res.status === 409) {
+    throw new SubmitError(await errorText(res, "All five photo spots are used."));
   }
   if (!res.ok) throw new SubmitError(`Could not start the upload (${res.status})`);
   const { url, key, publicPath } = (await res.json()) as {
@@ -178,7 +205,7 @@ export async function submitProposal(
   let publicPath: string | undefined;
 
   if (proposal.kind === "photo" && file) {
-    const up = await uploadPhoto(file, passcode);
+    const up = await uploadPhoto(file, passcode, proposal.personId);
     publicPath = up.publicPath;
     payload = {
       ...proposal,
@@ -197,6 +224,9 @@ export async function submitProposal(
   if (res.status === 401) {
     throw new SubmitError("That family passcode is not right.");
   }
+  if (res.status === 409) {
+    throw new SubmitError(await errorText(res, "All five photo spots are used."));
+  }
   if (!res.ok) {
     throw new SubmitError(
       res.status === 429
@@ -208,20 +238,27 @@ export async function submitProposal(
   return { publicPath, live: body.live };
 }
 
+async function errorText(res: Response, fallback: string): Promise<string> {
+  const body = (await res.json().catch(() => ({}))) as { error?: string };
+  return body.error ?? fallback;
+}
+
 /**
- * Take a published photograph off the tree for good: the row is marked
- * removed, the file is deleted from storage, and the gallery is rebuilt
- * without it. Only photographs the family published can go this way —
- * anything in tree.json is part of the deployed record.
+ * Make one photograph the main one for a person, for everyone. `photoId` is
+ * a live photo's id, or the src of a photograph in the record.
  */
-export async function deletePhoto(id: string, passcode: string): Promise<void> {
+export async function setPrimaryPhoto(
+  personId: string,
+  photoId: string,
+  passcode: string,
+): Promise<void> {
   if (!API) return;
-  const res = await postJson("/delete-photo", { id, passcode });
+  const res = await postJson("/primary", { personId, photoId, passcode });
   if (res.status === 401) {
     throw new SubmitError("That family passcode is not right.");
   }
   if (!res.ok) {
-    throw new SubmitError(`Could not remove it (${res.status})`);
+    throw new SubmitError(await errorText(res, `Could not save that (${res.status})`));
   }
 }
 
