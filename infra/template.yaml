@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Deguise Family Tree — static site on S3 + CloudFront, with a single Lambda
+  Function URL that records "suggest a person" submissions in DynamoDB and
+  emails the archivist via SES. No servers, no load balancers.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: deguise-tree
+    Description: Prefix for resource names.
+  AdminEmail:
+    Type: String
+    Description: >
+      Where submissions are emailed from and to. Must be a verified SES
+      identity in this region (see scripts/bootstrap.sh).
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Optional custom domain, e.g. deguisefamilytree.com.au
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ACM certificate ARN for DomainName. MUST be issued in
+      us-east-1 for CloudFront.
+  FamilyPasscode:
+    Type: String
+    NoEcho: true
+    MinLength: 4
+    Description: >
+      One shared word the family types once before uploading a photograph.
+      Photographs publish instantly to anyone who has it; without it the
+      upload endpoint refuses. Change it any time by rerunning bootstrap.
+  PriceClass:
+    Type: String
+    Default: PriceClass_All
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: >
+      PriceClass_All includes Australian edge locations. At this traffic
+      level the cost difference is negligible.
+
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Equals [!Ref AcmCertificateArn, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- site ----
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-site-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        # Any origin may attempt a PUT; the presigned signature is the gate,
+        # and the function only signs one after the family passcode checks out.
+        # Naming the distribution here would make the bucket depend on the
+        # distribution that already depends on the bucket.
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: ["*"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Lets CloudFront sign its requests to the Lambda Function URL, so the URL
+  # itself can require IAM auth and never be publicly invocable.
+  LambdaOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-lambda-oac"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} family tree"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        Aliases: !If [HasCustomDomain, [!Ref DomainName], !Ref "AWS::NoValue"]
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: s3-site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          # The Function URL, reached through CloudFront rather than directly.
+          # FunctionUrl is "https://host/", so element 2 of the split is the host.
+          - Id: lambda-api
+            DomainName: !Select [2, !Split ["/", !GetAtt SubmitUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt LambdaOriginAccessControl.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: s3-site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          # Managed-CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # Managed-SecurityHeadersPolicy
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        CacheBehaviors:
+          # The API, served from the site's own domain. Same origin as the
+          # page, so there is no CORS in this path at all — no preflight, no
+          # allowed-origin list, nothing to drift.
+          - PathPattern: /api/*
+            TargetOriginId: lambda-api
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            # Managed-CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # Managed-AllViewerExceptHostHeader. The Host must NOT be forwarded:
+            # the Function URL only answers to its own hostname.
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /gallery.json
+            TargetOriginId: s3-site
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            # Managed-CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        # No CustomErrorResponses. They cannot be scoped to one behaviour —
+        # CloudFront applies them across the whole distribution — so a
+        # 403 or 404 from the API origin came back as the home page with a
+        # 200, and the browser choked on "<!doctype" where JSON was expected.
+        # This site is a single page with no client-side routing, so it has
+        # nothing to gain from rewriting missing paths to index.html anyway.
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-uploads-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # No CORS rules: nothing in a browser writes here any more. Photographs
+      # go straight into the site bucket under photos/live/. Naming the
+      # distribution here would also close a dependency loop, since the
+      # distribution now depends on the Function URL and so on this function.
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-unapproved-uploads
+            Status: Enabled
+            Prefix: pending/
+            ExpirationInDays: 365
+
+  # ----------------------------------------------------------------- api ----
+
+  SubmissionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${ProjectName}-submissions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  SubmitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: submit
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt SubmissionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub "${SiteBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${UploadsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+
+  SubmitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-submit"
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt SubmitRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SubmissionsTable
+          UPLOAD_BUCKET: !Ref UploadsBucket
+          SITE_BUCKET: !Ref SiteBucket
+          FAMILY_PASSCODE: !Ref FamilyPasscode
+          ADMIN_EMAIL: !Ref AdminEmail
+          # Deliberately NOT derived from the distribution. The distribution
+          # now depends on the Function URL, which depends on this function —
+          # naming it here would close the loop and CloudFormation would refuse
+          # the whole template. No ALLOW_ORIGIN either: the API is same-origin
+          # with the site now, so there is no CORS to configure.
+          SITE_URL: !If
+            - HasCustomDomain
+            - !Sub "https://${DomainName}"
+            - ""
+      Code:
+        # Placeholder. scripts/deploy.sh uploads api/index.mjs over the top.
+        ZipFile: |
+          export const handler = async () => ({
+            statusCode: 503,
+            body: '{"error":"Function code not deployed yet"}'
+          });
+
+  SubmitLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-submit"
+      RetentionInDays: 90
+
+  SubmitUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt SubmitFunction.Arn
+      # IAM, not NONE. Nothing on the internet can invoke this directly; only
+      # CloudFront can, using the origin access control above. That sidesteps
+      # public-invoke restrictions entirely, and no CORS config is needed here
+      # because the browser only ever talks to the site's own domain.
+      AuthType: AWS_IAM
+
+  SubmitUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SubmitFunction.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  SiteUrl:
+    Value: !If
+      - HasCustomDomain
+      - !Sub "https://${DomainName}"
+      - !Sub "https://${Distribution.DomainName}"
+  CloudFrontDomain:
+    Value: !GetAtt Distribution.DomainName
+  ApiUrl:
+    Description: >
+      Put this in .env as VITE_API_URL. It is a path on the site's own domain,
+      not the Lambda hostname — the browser reaches the API through CloudFront.
+    Value: /api
+  FunctionUrlHost:
+    Description: The private origin behind /api. Not publicly invocable.
+    Value: !GetAtt SubmitUrl.FunctionUrl
+  SubmissionsTableName:
+    Value: !Ref SubmissionsTable
+  UploadsBucketName:
+    Value: !Ref UploadsBucket

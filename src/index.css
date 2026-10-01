@@ -1,0 +1,160 @@
+:root {
+  --bg: #fbf9f5;
+  --bg-grid: #e9e2d5;
+  --surface: #ffffff;
+  --surface-2: #f6f2ea;
+  --ink: #201a14;
+  --ink-2: #574d42;
+  --ink-3: #8c7f6f;
+  --line: #ddd3c2;
+  --edge-line: #c0b19a;
+  --accent: #8c2f16;
+  --accent-soft: #f0dcd3;
+  --ring: #c8622f;
+  --shadow: 0 1px 2px rgba(60, 45, 25, 0.05), 0 8px 24px rgba(60, 45, 25, 0.08);
+  --radius: 12px;
+
+  --branch-guise: #8c2f16;
+  --branch-brownlow: #a03a5e;
+  --branch-bradney: #2f5d62;
+  --branch-jones: #5b6b2f;
+  --branch-rock: #1f4e79;
+  --branch-freestone: #b06a1f;
+  --branch-staber: #6a4a86;
+  --branch-bastock: #17786b;
+  --branch-hayes: #4f7f9e;
+  --branch-mcenally: #a8735c;
+  --branch-mckenzie: #5f8a6e;
+  --branch-goodwin: #93803a;
+  --branch-ritchie: #8a6ba0;
+  --branch-johnston: #37707f;
+  --branch-taylor: #a3574a;
+  --branch-touzell: #77873f;
+  --branch-mciver: #5c6f9c;
+  --branch-newton: #96688a;
+  --branch-robson: #b0813a;
+  --branch-browne: #6d7b8c;
+  --branch-other: #9a8d7d;
+
+  color-scheme: light;
+}
+
+/* Dark tokens, applied when the viewer's system asks for dark and no
+   explicit light choice has been made on the page. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #1c1815;
+    --bg-grid: #2b251e;
+    --surface: #262019;
+    --surface-2: #302921;
+    --ink: #f4ece0;
+    --ink-2: #cabda9;
+    --ink-3: #968878;
+    --line: #4a3f33;
+    --edge-line: #5b4d3f;
+    --accent: #e0714a;
+    --accent-soft: #402a20;
+    --ring: #e0894a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 10px 30px rgba(0, 0, 0, 0.4);
+
+    --branch-guise: #e0714a;
+    --branch-brownlow: #e07ba0;
+    --branch-bradney: #63b0b8;
+    --branch-jones: #a3bb63;
+    --branch-rock: #6ea8dc;
+    --branch-freestone: #e8a349;
+    --branch-staber: #b294d8;
+    --branch-bastock: #4fc7ae;
+    --branch-hayes: #8fc0e0;
+    --branch-mcenally: #e0a48c;
+    --branch-mckenzie: #8fc9a3;
+    --branch-goodwin: #d4bc63;
+    --branch-ritchie: #c3a3d8;
+    --branch-johnston: #6fc3d4;
+    --branch-taylor: #e08a78;
+    --branch-touzell: #bcd070;
+    --branch-mciver: #93a8e0;
+    --branch-newton: #d69ec8;
+    --branch-robson: #e3bb6e;
+    --branch-browne: #a9b8c9;
+    --branch-other: #a89a88;
+  }
+}
+
+/* ...and again, so the page's own toggle wins over a light system. */
+:root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #1c1815;
+    --bg-grid: #2b251e;
+    --surface: #262019;
+    --surface-2: #302921;
+    --ink: #f4ece0;
+    --ink-2: #cabda9;
+    --ink-3: #968878;
+    --line: #4a3f33;
+    --edge-line: #5b4d3f;
+    --accent: #e0714a;
+    --accent-soft: #402a20;
+    --ring: #e0894a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 10px 30px rgba(0, 0, 0, 0.4);
+
+    --branch-guise: #e0714a;
+    --branch-brownlow: #e07ba0;
+    --branch-bradney: #63b0b8;
+    --branch-jones: #a3bb63;
+    --branch-rock: #6ea8dc;
+    --branch-freestone: #e8a349;
+    --branch-staber: #b294d8;
+    --branch-bastock: #4fc7ae;
+    --branch-hayes: #8fc0e0;
+    --branch-mcenally: #e0a48c;
+    --branch-mckenzie: #8fc9a3;
+    --branch-goodwin: #d4bc63;
+    --branch-ritchie: #c3a3d8;
+    --branch-johnston: #6fc3d4;
+    --branch-taylor: #e08a78;
+    --branch-touzell: #bcd070;
+    --branch-mciver: #93a8e0;
+    --branch-newton: #d69ec8;
+    --branch-robson: #e3bb6e;
+    --branch-browne: #a9b8c9;
+    --branch-other: #a89a88;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+    "Times New Roman", serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.sans {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
